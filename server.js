@@ -40,12 +40,19 @@ const ADMIN_SECRET = process.env.ADMIN_SECRET || 'key1905';
 const HOUSE_EDGE   = parseFloat(process.env.HOUSE_EDGE) || 0.04;
 
 /* ────────────────────────────────────────
-   SECURITY MIDDLEWARE
+   SECURITY & PARSING MIDDLEWARE
 ──────────────────────────────────────── */
 app.use(helmet({ contentSecurityPolicy: false, crossOriginEmbedderPolicy: false }));
-app.use(mongoSanitize());      
 app.use(cors({ origin: process.env.ALLOWED_ORIGINS || '*' }));
+
+// 1. Parse the request body FIRST
 app.use(express.json({ limit: '10kb' }));
+app.use(express.urlencoded({ extended: true, limit: '10kb' }));
+
+// 2. Sanitize the parsed data
+app.use(mongoSanitize());      
+
+// 3. Serve static files
 app.use(express.static(path.join(__dirname, 'public')));
 
 const authLimiter = rateLimit({
