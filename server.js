@@ -1,8 +1,8 @@
 /**
  * ═══════════════════════════════════════════════════════════
- * AVIATOR HELA — PRODUCTION SERVER v1.1
+ * AVIATOR HELA — PRODUCTION SERVER v1.2
  * Node.js + Express + Socket.IO + MongoDB
- * Upgraded Engine: Server-side Bots & Time-based Math
+ * Fixed: Node 22 Sanitize Bug Removed
  * ═══════════════════════════════════════════════════════════
  */
 
@@ -19,7 +19,6 @@ const cors          = require('cors');
 const crypto        = require('crypto');
 const rateLimit     = require('express-rate-limit');
 const helmet        = require('helmet');
-const mongoSanitize = require('express-mongo-sanitize');
 require('dotenv').config();
 
 const app    = express();
@@ -36,7 +35,6 @@ const io     = new Server(server, {
 const PORT         = process.env.PORT         || 3000;
 const MONGO_URI    = process.env.MONGO_URI    || 'mongodb://127.0.0.1:27017/aviator-hela';
 const JWT_SECRET   = process.env.JWT_SECRET   || 'change_this_in_production';
-const ADMIN_SECRET = process.env.ADMIN_SECRET || 'key1905';
 const HOUSE_EDGE   = parseFloat(process.env.HOUSE_EDGE) || 0.04;
 
 /* ────────────────────────────────────────
@@ -45,14 +43,9 @@ const HOUSE_EDGE   = parseFloat(process.env.HOUSE_EDGE) || 0.04;
 app.use(helmet({ contentSecurityPolicy: false, crossOriginEmbedderPolicy: false }));
 app.use(cors({ origin: process.env.ALLOWED_ORIGINS || '*' }));
 
-// 1. Parse the request body FIRST
 app.use(express.json({ limit: '10kb' }));
 app.use(express.urlencoded({ extended: true, limit: '10kb' }));
 
-// 2. Sanitize the parsed data
-app.use(mongoSanitize());      
-
-// 3. Serve static files
 app.use(express.static(path.join(__dirname, 'public')));
 
 const authLimiter = rateLimit({
@@ -130,18 +123,6 @@ const Round       = mongoose.model('Round', RoundSchema);
 ──────────────────────────────────────── */
 const genToken = (user) => jwt.sign({ id: user._id, phone: user.phone, role: user.role }, JWT_SECRET, { expiresIn: '7d' });
 
-const verifyToken = (req, res, next) => {
-  const header = req.headers.authorization || '';
-  const token  = header.startsWith('Bearer ') ? header.slice(7) : null;
-  if (!token) return res.status(401).json({ error: 'No token provided.' });
-  try {
-    req.user = jwt.verify(token, JWT_SECRET);
-    next();
-  } catch {
-    res.status(401).json({ error: 'Invalid or expired token.' });
-  }
-};
-
 const toLocalPhone = (p) => {
   const n = (p||'').replace(/\D/g,'');
   return n.startsWith('254') ? '0' + n.slice(3) : n;
@@ -198,7 +179,7 @@ app.post('/api/login', async (req, res) => {
 });
 
 /* ────────────────────────────────────────
-   AVIATOR ENGINE (THIN-CLIENT OPTIMIZED)
+   AVIATOR ENGINE
 ──────────────────────────────────────── */
 let gameState        = 'WAITING';
 let currentMult      = 1.00;
@@ -209,7 +190,6 @@ let flightTickInterval;
 let waitTickInterval;
 let activeRoundBets  = {};
 
-// Server-Side Bots
 const fakeNames = ["Kamau99", "072***12", "079***44", "011***88", "075***01", "Alex**", "Guest_48", "JohnDoe", "Wanjiku*", "Davy_K", "SpribeKing", "BetMaster", "Akinyi*", "User_992", "SammyBoy", "Winner254", "Boss_Man"];
 let serverBots = [];
 
@@ -267,15 +247,12 @@ function startRound() {
 
   generateBots();
 
-  // Broadcast WAITING state
   io.emit('game_event', { type: 'WAITING', time: 5, history: history.slice(0,15) });
   
-  // Broadcast simulated players joining
   serverBots.forEach(b => {
     io.emit('game_event', { type: 'PLAYER_JOINED', id: b.id, name: b.name, amt: b.amt });
   });
 
-  // 1-Second Precision Timer Logic
   let timeLeft = 5;
   waitTickInterval = setInterval(() => {
     timeLeft -= 1;
@@ -293,8 +270,6 @@ function startRound() {
 
     flightTickInterval = setInterval(() => {
       let elapsed = Date.now() - startTime;
-      
-      // Exact Math.E curve mapping to match the frontend
       currentMult = Math.max(1.00, Math.pow(Math.E, elapsed / 8000));
 
       if (currentMult >= targetCrashPoint) {
@@ -308,11 +283,10 @@ function startRound() {
         io.emit('game_event', { type: 'CRASHED', finalMult: currentMult });
         processCrashedBets();
 
-        setTimeout(startRound, 3500); // 3.5s pause before next round
+        setTimeout(startRound, 3500);
       } else {
         io.emit('game_event', { type: 'TICK', mult: parseFloat(currentMult.toFixed(2)) });
         
-        // Check if any bots should cash out at this exact multiplier
         serverBots.forEach(b => {
           if (!b.cashed && currentMult >= b.target) {
             b.cashed = true;
@@ -326,7 +300,7 @@ function startRound() {
           }
         });
       }
-    }, 50); // 50ms smooth tick rate
+    }, 50); 
   }, 5000);
 }
 
@@ -334,8 +308,6 @@ function startRound() {
    SOCKET.IO EVENT HANDLERS
 ──────────────────────────────────────── */
 io.on('connection', (socket) => {
-  
-  // Sync late connections with the current state
   if (gameState === 'FLYING') {
     socket.emit('game_event', { type: 'FLYING' });
     socket.emit('game_event', { type: 'TICK', mult: currentMult });
@@ -362,7 +334,6 @@ io.on('connection', (socket) => {
 
       socket.emit('betConfirmed', { newBalance: user.balance, betIndex });
       
-      // Broadcast real player bet to everyone
       io.emit('game_event', { 
         type: 'PLAYER_JOINED', 
         id: socket.id, 
@@ -398,7 +369,6 @@ io.on('connection', (socket) => {
 
       socket.emit('cashOutSuccess', { betIndex, multiplier: multi.toFixed(2), winnings: winnings.toFixed(2), newBalance: user.balance.toFixed(2) });
       
-      // Broadcast real player cashout to everyone
       io.emit('game_event', { 
         type: 'PLAYER_CASHOUT', 
         id: socket.id, 
@@ -415,6 +385,5 @@ io.on('connection', (socket) => {
 ──────────────────────────────────────── */
 server.listen(PORT, () => {
   console.log(`🚀 AviatorHela Server running on port ${PORT}`);
-  console.log(`⚙️  House edge: ${HOUSE_EDGE * 100}%`);
   startRound();
 });
