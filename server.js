@@ -2,7 +2,7 @@
  * ═══════════════════════════════════════════════════════════
  * AVIATOR HELA — PRODUCTION SERVER v1.2
  * Node.js + Express + Socket.IO + MongoDB
- * Fixed: Node 22 Sanitize Bug Removed
+ * Fixed: Node 22 Sanitize Bug Removed, CORS/Syntax Fixed
  * ═══════════════════════════════════════════════════════════
  */
 
@@ -23,8 +23,21 @@ require('dotenv').config();
 
 const app    = express();
 const server = http.createServer(app);
-const io     = new Server(server, {
-  cors: { origin: process.env.ALLOWED_ORIGINS || '*', methods: ['GET','POST'] },
+
+// Allowed origins for your live domain
+const allowedOrigins = [
+  'https://aviatorhela.com', 
+  'https://www.aviatorhela.com',
+  'https://api.aviatorhela.com'
+];
+
+// 1. Correct Socket.IO Initialization
+const io = new Server(server, {
+  cors: { 
+    origin: allowedOrigins, 
+    methods: ['GET', 'POST'],
+    credentials: true
+  },
   pingTimeout: 60000,
   pingInterval: 25000,
 });
@@ -32,7 +45,7 @@ const io     = new Server(server, {
 /* ────────────────────────────────────────
    ENVIRONMENT CONSTANTS
 ──────────────────────────────────────── */
-const PORT         = process.env.PORT         || 3000;
+const PORT         = process.env.PORT         || 3005;
 const MONGO_URI    = process.env.MONGO_URI    || 'mongodb://127.0.0.1:27017/aviator-hela';
 const JWT_SECRET   = process.env.JWT_SECRET   || 'change_this_in_production';
 const HOUSE_EDGE   = parseFloat(process.env.HOUSE_EDGE) || 0.04;
@@ -41,7 +54,13 @@ const HOUSE_EDGE   = parseFloat(process.env.HOUSE_EDGE) || 0.04;
    SECURITY & PARSING MIDDLEWARE
 ──────────────────────────────────────── */
 app.use(helmet({ contentSecurityPolicy: false, crossOriginEmbedderPolicy: false }));
-app.use(cors({ origin: process.env.ALLOWED_ORIGINS || '*' }));
+
+// 2. Correct Express CORS Middleware
+app.use(cors({
+  origin: allowedOrigins,
+  methods: ['GET', 'POST', 'PUT', 'DELETE'],
+  credentials: true
+}));
 
 app.use(express.json({ limit: '10kb' }));
 app.use(express.urlencoded({ extended: true, limit: '10kb' }));
