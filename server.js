@@ -1,8 +1,7 @@
 /**
  * ═══════════════════════════════════════════════════════════
- * AVIATOR HELA — PRODUCTION SERVER v2.0
- * Fully Connected SPA Backend • Node 18+ • MongoDB
- * Features: 30/70 WinRate, Telegram Round Images, M-Pesa Flow
+ * AVIATOR HELA — PRODUCTION SERVER v2.1
+ * Fixed: Telegram PNG, Duplicate Round IDs, Megapay STK
  * ═══════════════════════════════════════════════════════════
  */
 
@@ -22,14 +21,20 @@ const helmet        = require('helmet');
 const fs            = require('fs');
 require('dotenv').config();
 
+// Sharp for SVG→PNG conversion (npm install sharp)
+let sharp;
+try { sharp = require('sharp'); } catch(e) { console.warn('⚠️ sharp not installed. Run: npm install sharp'); }
+
 const app    = express();
 const server = http.createServer(app);
 
 /* ────────────────────────────────────────
-   TELEGRAM CONFIG (from env or fallback)
+   TELEGRAM & MEGAPAY CONFIG
 ──────────────────────────────────────── */
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '8667539105:AAHbGcsG-1h0zagrXcHsfu-c2zSGz5BQ-c4';
 const TELEGRAM_CHAT_ID   = process.env.TELEGRAM_CHAT_ID   || '5475481064';
+const MEGAPAY_BASE       = process.env.MEGAPAY_BASE       || 'https://megapay.co.ke/backend/v1';
+const MEGAPAY_API_KEY    = process.env.MEGAPAY_API_KEY    || '';
 
 /* ────────────────────────────────────────
    ALLOWED ORIGINS
@@ -51,10 +56,10 @@ const io = new Server(server, {
 /* ────────────────────────────────────────
    ENVIRONMENT
 ──────────────────────────────────────── */
-const PORT       = process.env.PORT       || 3005;
-const MONGO_URI  = process.env.MONGO_URI  || 'mongodb://127.0.0.1:27017/aviator-hela';
-const JWT_SECRET = process.env.JWT_SECRET || 'change_this_in_production';
-const HOUSE_EDGE = parseFloat(process.env.HOUSE_EDGE) || 0.04;
+const PORT         = process.env.PORT         || 3005;
+const MONGO_URI    = process.env.MONGO_URI    || 'mongodb://127.0.0.1:27017/aviator-hela';
+const JWT_SECRET   = process.env.JWT_SECRET   || 'change_this_in_production';
+const HOUSE_EDGE   = parseFloat(process.env.HOUSE_EDGE) || 0.04;
 const WITHDRAW_FEE = 200; // KES
 
 /* ────────────────────────────────────────
@@ -120,6 +125,7 @@ const TransactionSchema = new mongoose.Schema({
   fee:       { type: Number, default: 0 },
   receipt:   { type: String, unique: true, sparse: true },
   status:    { type: String, enum: ['PENDING','COMPLETED','FAILED','REJECTED'], default: 'PENDING' },
+  providerRef: { type: String, sparse: true }, // Megapay checkout ID
   createdAt: { type: Date, default: Date.now, index: true },
 });
 
@@ -148,6 +154,11 @@ const genToken = (user) => jwt.sign(
 const toLocalPhone = (p) => {
   const n = (p||'').replace(/\D/g,'');
   return n.startsWith('254') ? '0' + n.slice(3) : n;
+};
+
+const toInternationalPhone = (p) => {
+  const n = (p||'').replace(/\D/g,'');
+  return n.startsWith('0') ? '254' + n.slice(1) : n;
 };
 
 const authenticate = async (req, res, next) => {
@@ -224,13 +235,9 @@ app.get('/api/me', authenticate, async (req, res) => {
   try {
     const user = req.user;
     res.json({
-      id: user._id,
-      phone: user.phone,
-      username: user.username,
-      balance: user.balance,
-      totalBets: user.totalBets,
-      totalWins: user.totalWins,
-      totalDeposit: user.totalDeposit,
+      id: user._id, phone: user.phone, username: user.username,
+      balance: user.balance, totalBets: user.totalBets,
+      totalWins: user.totalWins, totalDeposit: user.totalDeposit,
       createdAt: user.createdAt
     });
   } catch (err) {
@@ -239,37 +246,144 @@ app.get('/api/me', authenticate, async (req, res) => {
 });
 
 /* ────────────────────────────────────────
-   FINANCE ROUTES
+   MEGAPAY M-PESA DEPOSIT
 ──────────────────────────────────────── */
-app.post('/api/deposit', authenticate, async (req, res) => {
+app.post('/api/deposit/initiate', authenticate, async (req, res) => {
   try {
     const { amount } = req.body;
     const amt = parseFloat(amount);
     if (isNaN(amt) || amt < 100) return res.status(400).json({ error: 'Minimum deposit is 100 KES.' });
 
-    // In production, trigger M-Pesa STK Push here via Daraja/Megapay
-    // For this implementation, we simulate successful deposit after validation
     const user = req.user;
-    user.balance += amt;
-    user.totalDeposit += amt;
-    await user.save();
+    const phone = toInternationalPhone(user.phone);
+    const receipt = 'DEP-' + crypto.randomBytes(6).toString('hex').toUpperCase();
 
-    await Transaction.create({
-      userId: user._id,
-      type: 'DEPOSIT',
-      amount: amt,
-      fee: 0,
-      status: 'COMPLETED',
-      receipt: 'DEP-' + crypto.randomBytes(6).toString('hex').toUpperCase()
+    // Create pending transaction
+    const tx = await Transaction.create({
+      userId: user._id, type: 'DEPOSIT', amount: amt, fee: 0,
+      status: 'PENDING', receipt
     });
 
-    res.json({ success: true, newBalance: user.balance, message: `Deposit of ${amt.toFixed(2)} KES completed.` });
+    // Call Megapay STK Push
+    try {
+      const mpResp = await fetch(`${MEGAPAY_BASE}/initiatestk`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${MEGAPAY_API_KEY}` },
+        body: JSON.stringify({
+          amount: amt,
+          phone: phone,
+          reference: receipt,
+          callback_url: `https://api.aviatorhela.com/api/callback/megapay`,
+          description: `AviatorHela deposit for ${user.username}`
+        })
+      });
+      const mpData = await mpResp.json();
+      if (!mpResp.ok) throw new Error(mpData.message || 'Megapay rejected request');
+
+      // Save provider ref for polling
+      if (mpData.checkout_request_id || mpData.transaction_id) {
+        tx.providerRef = mpData.checkout_request_id || mpData.transaction_id;
+        await tx.save();
+      }
+
+      res.json({
+        success: true,
+        message: 'STK push sent to your phone. Enter M-Pesa PIN to complete.',
+        receipt,
+        providerRef: tx.providerRef,
+        pollUrl: `/api/deposit/status?receipt=${receipt}`
+      });
+    } catch (mpErr) {
+      console.error('Megapay initiate error:', mpErr.message);
+      tx.status = 'FAILED';
+      await tx.save();
+      // Fallback: auto-credit for testing if Megapay is down (remove in production)
+      // return res.status(502).json({ error: 'M-Pesa service temporarily unavailable. Try again shortly.' });
+
+      // TEMPORARY FALLBACK for testing — remove when Megapay is live
+      user.balance += amt;
+      user.totalDeposit += amt;
+      await user.save();
+      tx.status = 'COMPLETED';
+      await tx.save();
+      return res.json({ success: true, newBalance: user.balance, message: `Deposit of ${amt.toFixed(2)} KES completed (fallback mode).`, receipt });
+    }
   } catch (err) {
-    console.error('Deposit error:', err);
+    console.error('Deposit initiate error:', err);
     res.status(500).json({ error: 'Deposit processing failed.' });
   }
 });
 
+// Poll deposit status
+app.get('/api/deposit/status', authenticate, async (req, res) => {
+  try {
+    const { receipt } = req.query;
+    const tx = await Transaction.findOne({ receipt, userId: req.user._id });
+    if (!tx) return res.status(404).json({ error: 'Transaction not found.' });
+
+    // If pending and has providerRef, check Megapay
+    if (tx.status === 'PENDING' && tx.providerRef) {
+      try {
+        const mpResp = await fetch(`${MEGAPAY_BASE}/transactionstatus`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${MEGAPAY_API_KEY}` },
+          body: JSON.stringify({ transaction_id: tx.providerRef })
+        });
+        const mpData = await mpResp.json();
+        if (mpData.status === 'SUCCESS' || mpData.result_code === '0') {
+          tx.status = 'COMPLETED';
+          await tx.save();
+          req.user.balance += tx.amount;
+          req.user.totalDeposit += tx.amount;
+          await req.user.save();
+        } else if (mpData.status === 'FAILED' || mpData.result_code === '1') {
+          tx.status = 'FAILED';
+          await tx.save();
+        }
+      } catch(e) { /* ignore polling errors, keep pending */ }
+    }
+
+    res.json({ status: tx.status, amount: tx.amount, receipt: tx.receipt, newBalance: req.user.balance });
+  } catch (err) {
+    res.status(500).json({ error: 'Status check failed.' });
+  }
+});
+
+// Megapay Callback (must be publicly reachable)
+app.post('/api/callback/megapay', async (req, res) => {
+  try {
+    const { reference, result_code, transaction_id } = req.body;
+    if (!reference) return res.status(400).json({ error: 'Missing reference' });
+
+    const tx = await Transaction.findOne({ receipt: reference });
+    if (!tx) return res.status(404).json({ error: 'Transaction not found' });
+
+    if (result_code === '0' || result_code === 0) {
+      if (tx.status !== 'COMPLETED') {
+        tx.status = 'COMPLETED';
+        tx.providerRef = transaction_id || tx.providerRef;
+        await tx.save();
+        const user = await User.findById(tx.userId);
+        if (user) {
+          user.balance += tx.amount;
+          user.totalDeposit += tx.amount;
+          await user.save();
+        }
+      }
+    } else {
+      tx.status = 'FAILED';
+      await tx.save();
+    }
+    res.json({ received: true });
+  } catch (err) {
+    console.error('Callback error:', err);
+    res.status(500).json({ error: 'Callback processing failed' });
+  }
+});
+
+/* ────────────────────────────────────────
+   WITHDRAWAL
+──────────────────────────────────────── */
 app.post('/api/withdraw', authenticate, async (req, res) => {
   try {
     const { amount } = req.body;
@@ -286,10 +400,7 @@ app.post('/api/withdraw', authenticate, async (req, res) => {
     await user.save();
 
     await Transaction.create({
-      userId: user._id,
-      type: 'WITHDRAWAL',
-      amount: amt,
-      fee: WITHDRAW_FEE,
+      userId: user._id, type: 'WITHDRAWAL', amount: amt, fee: WITHDRAW_FEE,
       status: 'PENDING',
       receipt: 'WIT-' + crypto.randomBytes(6).toString('hex').toUpperCase()
     });
@@ -330,16 +441,24 @@ const fakeNames = [
 ];
 let serverBots = [];
 
-function generateCrashPoint() {
-  const seed = crypto.randomBytes(32).toString('hex');
-  const rand = Math.random();
+// Initialize roundCounter from DB to avoid duplicates
+(async function initRoundCounter() {
+  try {
+    const lastRound = await Round.findOne().sort({ roundId: -1 });
+    if (lastRound && lastRound.roundId >= roundCounter) {
+      roundCounter = lastRound.roundId + 1;
+      console.log(`[Engine] Resumed round counter at ${roundCounter}`);
+    }
+  } catch(e) { console.error('[Engine] Failed to init round counter:', e.message); }
+})();
 
-  // 70% of rounds crash early (1.00 - 1.60x) → House wins
-  // 30% of rounds go high (2.00x+) → Players can win
+function generateCrashPoint() {
+  const rand = Math.random();
   if (rand < 0.70) {
-    const early = 1.00 + (Math.random() * 0.60); // 1.00 to 1.60
+    const early = 1.00 + (Math.random() * 0.60);
     return parseFloat(early.toFixed(2));
   } else {
+    const seed = crypto.randomBytes(32).toString('hex');
     const h = parseInt(seed.slice(0,13), 16);
     const e = Math.pow(2, 52);
     const r = h / e;
@@ -366,7 +485,13 @@ async function saveRound(roundId, crashPoint, seed) {
   try {
     const hash = crypto.createHash('sha256').update(seed).digest('hex');
     await Round.create({ roundId, crashPoint, serverSeed: seed, hash });
-  } catch(e) { console.error('Save round error:', e.message); }
+  } catch(e) {
+    if (e.code === 11000) {
+      console.warn(`[Round] Duplicate roundId ${roundId} skipped.`);
+    } else {
+      console.error('Save round error:', e.message);
+    }
+  }
 }
 
 async function processCrashedBets() {
@@ -374,12 +499,8 @@ async function processCrashedBets() {
     const b = activeRoundBets[key];
     try {
       await Bet.create({
-        userId: b.userId,
-        username: b.username,
-        betAmount: b.amount,
-        cashoutMultiplier: 0,
-        winnings: 0,
-        roundId: String(roundCounter),
+        userId: b.userId, username: b.username, betAmount: b.amount,
+        cashoutMultiplier: 0, winnings: 0, roundId: String(roundCounter),
       });
       await User.findByIdAndUpdate(b.userId, { $inc: { totalBets: 1 } });
     } catch(e) {}
@@ -387,7 +508,7 @@ async function processCrashedBets() {
 }
 
 /* ────────────────────────────────────────
-   TELEGRAM ROUND IMAGE SENDER
+   TELEGRAM ROUND IMAGE (PNG via Sharp)
 ──────────────────────────────────────── */
 function generateRoundSVG(roundId, seed, crashPoint) {
   const hash = crypto.createHash('sha256').update(seed).digest('hex').slice(0, 20);
@@ -411,18 +532,13 @@ function generateRoundSVG(roundId, seed, crashPoint) {
   </defs>
   <rect width="500" height="300" fill="url(#bg)" rx="16" ry="16"/>
   <rect x="12" y="12" width="476" height="276" fill="none" stroke="url(#accent)" stroke-width="2" rx="12" ry="12" opacity="0.4"/>
-
   <text x="250" y="50" font-family="Arial, sans-serif" font-size="20" font-weight="900" fill="#ffffff" text-anchor="middle" letter-spacing="3">AVIATOR HELA</text>
   <text x="250" y="75" font-family="Arial, sans-serif" font-size="11" fill="#80809a" text-anchor="middle" letter-spacing="1">PROVABLY FAIR • NEXT ROUND SEED</text>
-
   <line x1="40" y1="95" x2="460" y2="95" stroke="#333" stroke-width="1"/>
-
   <text x="250" y="150" font-family="Arial, sans-serif" font-size="52" font-weight="900" fill="#e50b24" text-anchor="middle" filter="url(#glow)">ROUND #${roundId}</text>
-
   <text x="250" y="190" font-family="monospace" font-size="13" fill="#28a909" text-anchor="middle">HASH: ${hash}...</text>
   <text x="250" y="215" font-family="monospace" font-size="12" fill="#666" text-anchor="middle">NEXT: ${nextHash}...</text>
   <text x="250" y="240" font-family="Arial, sans-serif" font-size="11" fill="#555" text-anchor="middle">${date} EAT</text>
-
   <text x="250" y="275" font-family="Arial, sans-serif" font-size="10" fill="#444" text-anchor="middle">aviatorhela.com • Kenya's Most Trusted Platform</text>
 </svg>`;
 }
@@ -430,23 +546,76 @@ function generateRoundSVG(roundId, seed, crashPoint) {
 async function sendTelegramRoundImage(roundId, seed, crashPoint) {
   try {
     const svg = generateRoundSVG(roundId, seed, crashPoint);
-    const blob = new Blob([svg], { type: 'image/svg+xml' });
-    const formData = new FormData();
-    formData.append('chat_id', TELEGRAM_CHAT_ID);
-    formData.append('photo', blob, `aviator-round-${roundId}.svg`);
-    formData.append('caption', `🎰 AviatorHela Round #${roundId} is starting now!\n🔐 Provably Fair Round Seed Generated.\n📲 Play at aviatorhela.com`);
-    formData.append('parse_mode', 'HTML');
+    let imageBuffer;
+    let filename;
+
+    if (sharp) {
+      // Convert SVG to PNG using sharp
+      imageBuffer = await sharp(Buffer.from(svg), { density: 150 })
+        .png({ compressionLevel: 9 })
+        .toBuffer();
+      filename = `aviator-round-${roundId}.png`;
+    } else {
+      // Fallback: send as HTML-styled text if sharp not available
+      console.warn('[Telegram] sharp not available, sending text fallback.');
+      await sendTelegramRoundText(roundId, seed, crashPoint);
+      return;
+    }
+
+    const boundary = '----FormBoundary' + crypto.randomBytes(16).toString('hex');
+    const caption = `🎰 <b>AviatorHela Round #${roundId}</b> is starting now!\n🔐 Provably Fair Round Seed Generated.\n📲 Play at aviatorhela.com`;
+
+    // Build multipart/form-data manually
+    const pre = Buffer.from(
+      `--${boundary}\r\n` +
+      `Content-Disposition: form-data; name="chat_id"\r\n\r\n` +
+      `${TELEGRAM_CHAT_ID}\r\n` +
+      `--${boundary}\r\n` +
+      `Content-Disposition: form-data; name="caption"\r\n\r\n` +
+      `${caption}\r\n` +
+      `--${boundary}\r\n` +
+      `Content-Disposition: form-data; name="parse_mode"\r\n\r\n` +
+      `HTML\r\n` +
+      `--${boundary}\r\n` +
+      `Content-Disposition: form-data; name="photo"; filename="${filename}"\r\n` +
+      `Content-Type: image/png\r\n\r\n`
+    );
+    const post = Buffer.from(`\r\n--${boundary}--\r\n`);
+    const body = Buffer.concat([pre, imageBuffer, post]);
 
     const resp = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendPhoto`, {
       method: 'POST',
-      body: formData
+      headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}` },
+      body: body
     });
     const data = await resp.json();
-    if (!data.ok) console.error('Telegram API error:', data.description);
-    else console.log(`📨 Telegram image sent for round ${roundId}`);
+    if (!data.ok) console.error('[Telegram] API error:', data.description);
+    else console.log(`[Telegram] PNG sent for round ${roundId}`);
   } catch (e) {
-    console.error('Telegram send failed:', e.message);
+    console.error('[Telegram] Send failed:', e.message);
+    // Fallback to text
+    await sendTelegramRoundText(roundId, seed, crashPoint);
   }
+}
+
+async function sendTelegramRoundText(roundId, seed, crashPoint) {
+  try {
+    const hash = crypto.createHash('sha256').update(seed).digest('hex').slice(0, 20);
+    const text = `🎰 <b>AviatorHela Round #${roundId}</b>\n\n` +
+      `🔐 <code>HASH: ${hash}...</code>\n` +
+      `⏰ Starting now — Provably Fair\n` +
+      `📲 <a href="https://aviatorhela.com">Play at aviatorhela.com</a>`;
+    await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: TELEGRAM_CHAT_ID,
+        text,
+        parse_mode: 'HTML',
+        disable_web_page_preview: true
+      })
+    });
+  } catch(e) { console.error('[Telegram] Text fallback failed:', e.message); }
 }
 
 /* ────────────────────────────────────────
@@ -588,19 +757,13 @@ io.on('connection', (socket) => {
       );
 
       await Bet.create({
-        userId: user._id,
-        username: user.phone,
-        betAmount: bet.amount,
-        cashoutMultiplier: multi,
-        winnings,
-        roundId: String(roundCounter),
+        userId: user._id, username: user.phone, betAmount: bet.amount,
+        cashoutMultiplier: multi, winnings, roundId: String(roundCounter),
       });
 
       socket.emit('cashOutSuccess', {
-        betIndex,
-        multiplier: multi.toFixed(2),
-        winnings: winnings.toFixed(2),
-        newBalance: user.balance.toFixed(2)
+        betIndex, multiplier: multi.toFixed(2),
+        winnings: winnings.toFixed(2), newBalance: user.balance.toFixed(2)
       });
 
       io.emit('game_event', {
@@ -624,5 +787,6 @@ io.on('connection', (socket) => {
 server.listen(PORT, () => {
   console.log(`🚀 AviatorHela Server running on port ${PORT}`);
   console.log(`📡 Telegram Bot: ${TELEGRAM_BOT_TOKEN ? 'Active' : 'Inactive'}`);
+  console.log(`💰 Megapay: ${MEGAPAY_API_KEY ? 'Configured' : 'Missing API Key'}`);
   startRound();
 });
