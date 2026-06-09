@@ -1,7 +1,7 @@
 /**
  * ═══════════════════════════════════════════════════════════
- * AVIATOR HELA — PRODUCTION SERVER v2.2
- * Fixed: Telegram Multiplier Display, Throttled Frequency, 50% Margin
+ * AVIATOR HELA — PRODUCTION SERVER v2.3
+ * Fixed: Auto Round IDs, Sharp Optional, Complete File
  * ═══════════════════════════════════════════════════════════
  */
 
@@ -20,12 +20,16 @@ const rateLimit     = require('express-rate-limit');
 const helmet        = require('helmet');
 require('dotenv').config();
 
+// Sharp optional — will use text fallback if not installed
 let sharp;
-try { sharp = require('sharp'); } catch(e) { console.warn('⚠️ sharp not installed. Run: npm install sharp'); }
+try { sharp = require('sharp'); } catch(e) { console.log('[Init] sharp not installed — Telegram will use text fallback'); }
 
 const app    = express();
 const server = http.createServer(app);
 
+/* ────────────────────────────────────────
+   CONFIG
+──────────────────────────────────────── */
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '8667539105:AAHbGcsG-1h0zagrXcHsfu-c2zSGz5BQ-c4';
 const TELEGRAM_CHAT_ID   = process.env.TELEGRAM_CHAT_ID   || '5475481064';
 const MEGAPAY_BASE       = process.env.MEGAPAY_BASE       || 'https://megapay.co.ke/backend/v1';
@@ -47,6 +51,9 @@ const JWT_SECRET = process.env.JWT_SECRET || 'change_this_in_production';
 const HOUSE_EDGE = parseFloat(process.env.HOUSE_EDGE) || 0.04;
 const WITHDRAW_FEE = 200;
 
+/* ────────────────────────────────────────
+   MIDDLEWARE
+──────────────────────────────────────── */
 app.use(helmet({ contentSecurityPolicy: false, crossOriginEmbedderPolicy: false }));
 app.use(cors({ origin: allowedOrigins, methods: ['GET','POST','PUT','DELETE'], credentials: true }));
 app.use(express.json({ limit: '10kb' }));
@@ -55,8 +62,11 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, message: { error: 'Too many requests. Please wait 15 minutes.' } });
 app.use('/api/register', authLimiter);
-app.use('/api/login', authLimiter);
+app.use('/api/login',    authLimiter);
 
+/* ────────────────────────────────────────
+   DATABASE
+──────────────────────────────────────── */
 mongoose.connect(MONGO_URI, { maxPoolSize: 10, serverSelectionTimeoutMS: 5000, socketTimeoutMS: 45000 })
 .then(() => console.log('✅ MongoDB connected'))
 .catch(err => { console.error('❌ MongoDB error:', err.message); process.exit(1); });
@@ -64,6 +74,9 @@ mongoose.connect(MONGO_URI, { maxPoolSize: 10, serverSelectionTimeoutMS: 5000, s
 mongoose.connection.on('disconnected', () => console.warn('[DB] Disconnected'));
 mongoose.connection.on('reconnected', () => console.log('[DB] Reconnected'));
 
+/* ────────────────────────────────────────
+   SCHEMAS
+──────────────────────────────────────── */
 const UserSchema = new mongoose.Schema({
   phone: { type: String, required: true, unique: true, trim: true, index: true },
   username: { type: String, required: true, trim: true },
@@ -111,6 +124,9 @@ const Bet = mongoose.model('Bet', BetSchema);
 const Transaction = mongoose.model('Transaction', TransactionSchema);
 const Round = mongoose.model('Round', RoundSchema);
 
+/* ────────────────────────────────────────
+   AUTH HELPERS
+──────────────────────────────────────── */
 const genToken = (user) => jwt.sign({ id: user._id, phone: user.phone, role: user.role }, JWT_SECRET, { expiresIn: '7d' });
 const toLocalPhone = (p) => { const n = (p||'').replace(/\D/g,''); return n.startsWith('254') ? '0' + n.slice(3) : n; };
 const toInternationalPhone = (p) => { const n = (p||'').replace(/\D/g,''); return n.startsWith('0') ? '254' + n.slice(1) : n; };
@@ -126,6 +142,9 @@ const authenticate = async (req, res, next) => {
   } catch (err) { return res.status(401).json({ error: 'Invalid or expired token.' }); }
 };
 
+/* ────────────────────────────────────────
+   AUTH ROUTES
+──────────────────────────────────────── */
 app.post('/api/register', async (req, res) => {
   try {
     const { username, phone, password } = req.body;
@@ -163,6 +182,9 @@ app.get('/api/me', authenticate, async (req, res) => {
   } catch (err) { res.status(500).json({ error: 'Failed to fetch user.' }); }
 });
 
+/* ────────────────────────────────────────
+   MEGAPAY DEPOSIT
+──────────────────────────────────────── */
 app.post('/api/deposit/initiate', authenticate, async (req, res) => {
   try {
     const { amount } = req.body;
@@ -232,6 +254,9 @@ app.post('/api/callback/megapay', async (req, res) => {
   } catch (err) { console.error('Callback error:', err); res.status(500).json({ error: 'Callback processing failed' }); }
 });
 
+/* ────────────────────────────────────────
+   WITHDRAWAL
+──────────────────────────────────────── */
 app.post('/api/withdraw', authenticate, async (req, res) => {
   try {
     const { amount } = req.body;
@@ -264,22 +289,13 @@ let waitTickInterval;
 let activeRoundBets = {};
 let roundStartTime = Date.now();
 let telegramSkipCounter = 0;
-let telegramSendEvery = 4; // Send every 4th round (adjustable)
+let telegramSendEvery = 4;
 
 const fakeNames = ["Kamau99","072***12","079***44","011***88","075***01","Alex**","Guest_48","JohnDoe","Wanjiku*","Davy_K","SpribeKing","BetMaster","Akinyi*","User_992","SammyBoy","Winner254","Boss_Man","Msoo_Ke","LuckyOne","Punter_7"];
 let serverBots = [];
 
-(async function initRoundCounter() {
-  try {
-    const lastRound = await Round.findOne().sort({ roundId: -1 });
-    if (lastRound && lastRound.roundId >= roundCounter) { roundCounter = lastRound.roundId + 1; console.log(`[Engine] Resumed round counter at ${roundCounter}`); }
-  } catch(e) { console.error('[Engine] Failed to init round counter:', e.message); }
-})();
-
 function generateCrashPoint() {
   const rand = Math.random();
-  // 50% of rounds crash early (1.00 - 1.80x) → House wins
-  // 50% of rounds go high (2.00x+) → Players can win
   if (rand < 0.50) {
     const early = 1.00 + (Math.random() * 0.80);
     return parseFloat(early.toFixed(2));
@@ -312,8 +328,11 @@ async function saveRound(roundId, crashPoint, seed) {
     const hash = crypto.createHash('sha256').update(seed).digest('hex');
     await Round.create({ roundId, crashPoint, serverSeed: seed, hash });
   } catch(e) {
-    if (e.code === 11000) console.warn(`[Round] Duplicate roundId ${roundId} skipped.`);
-    else console.error('Save round error:', e.message);
+    if (e.code === 11000) {
+      console.warn(`[Round] Duplicate roundId ${roundId} skipped — will auto-increment next.`);
+    } else {
+      console.error('Save round error:', e.message);
+    }
   }
 }
 
@@ -333,7 +352,6 @@ async function processCrashedBets() {
 function generateMultiplierSVG(multiplier) {
   const isHigh = multiplier >= 2.0;
   const color = isHigh ? '#28a909' : '#e50b24';
-  const glowColor = isHigh ? 'rgba(40,169,9,0.4)' : 'rgba(229,11,36,0.4)';
   const date = new Date().toLocaleString('en-KE', { timeZone: 'Africa/Nairobi', hour12: false });
 
   return `<svg xmlns="http://www.w3.org/2000/svg" width="600" height="340" viewBox="0 0 600 340">
@@ -342,10 +360,6 @@ function generateMultiplierSVG(multiplier) {
       <stop offset="0%" style="stop-color:#0a0a0f;stop-opacity:1" />
       <stop offset="100%" style="stop-color:#1a0a0f;stop-opacity:1" />
     </linearGradient>
-    <filter id="glow">
-      <feGaussianBlur stdDeviation="4" result="coloredBlur"/>
-      <feMerge><feMergeNode in="coloredBlur"/><feMergeNode in="SourceGraphic"/></feMerge>
-    </filter>
     <filter id="textGlow">
       <feGaussianBlur stdDeviation="3" result="blur"/>
       <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
@@ -353,25 +367,13 @@ function generateMultiplierSVG(multiplier) {
   </defs>
   <rect width="600" height="340" fill="url(#bg)" rx="20" ry="20"/>
   <rect x="14" y="14" width="572" height="312" fill="none" stroke="${color}" stroke-width="3" rx="16" ry="16" opacity="0.5"/>
-
-  <!-- Top Brand -->
   <text x="300" y="55" font-family="Arial Black, Arial, sans-serif" font-size="22" font-weight="900" fill="#ffffff" text-anchor="middle" letter-spacing="4">AVIATOR HELA</text>
   <text x="300" y="82" font-family="Arial, sans-serif" font-size="12" fill="#666" text-anchor="middle" letter-spacing="2">KENYA'S MOST TRUSTED CRASH GAME</text>
-
-  <!-- Divider -->
   <line x1="60" y1="100" x2="540" y2="100" stroke="#333" stroke-width="1"/>
-
-  <!-- Label -->
   <text x="300" y="140" font-family="Arial, sans-serif" font-size="16" font-weight="700" fill="#888" text-anchor="middle" letter-spacing="3">NEXT ROUND MULTIPLIER</text>
-
-  <!-- Main Multiplier -->
   <text x="300" y="230" font-family="Arial Black, Arial, sans-serif" font-size="90" font-weight="900" fill="${color}" text-anchor="middle" filter="url(#textGlow)" letter-spacing="-2">x${multiplier}</text>
-
-  <!-- Indicator -->
   <rect x="220" y="250" width="160" height="36" rx="18" fill="${color}" opacity="0.15" stroke="${color}" stroke-width="1"/>
-  <text x="300" y="274" font-family="Arial, sans-serif" font-size="14" font-weight="700" fill="${color}" text-anchor="middle">${isHigh ? '🔥 HIGH POTENTIAL' : '⚡ PLAY NOW'}</text>
-
-  <!-- Footer -->
+  <text x="300" y="274" font-family="Arial, sans-serif" font-size="14" font-weight="700" fill="${color}" text-anchor="middle">${isHigh ? 'HIGH POTENTIAL' : 'PLAY NOW'}</text>
   <text x="300" y="310" font-family="monospace" font-size="11" fill="#444" text-anchor="middle">${date} EAT • aviatorhela.com</text>
 </svg>`;
 }
@@ -386,7 +388,6 @@ async function sendTelegramMultiplierImage(multiplier) {
       imageBuffer = await sharp(Buffer.from(svg), { density: 144 }).png({ compressionLevel: 9 }).toBuffer();
       filename = `aviator-next-x${multiplier}.png`;
     } else {
-      console.warn('[Telegram] sharp not available, sending text fallback.');
       await sendTelegramMultiplierText(multiplier);
       return;
     }
@@ -429,31 +430,42 @@ async function sendTelegramMultiplierText(multiplier) {
 }
 
 /* ────────────────────────────────────────
-   ROUND MANAGER
+   ROUND MANAGER — AUTO-INCREMENT SAFE
 ──────────────────────────────────────── */
-function startRound() {
+async function getNextRoundId() {
+  // Ensure we never collide with existing DB records
+  try {
+    const lastRound = await Round.findOne().sort({ roundId: -1 });
+    if (lastRound && lastRound.roundId >= roundCounter) {
+      roundCounter = lastRound.roundId;
+    }
+  } catch(e) {}
+  roundCounter++;
+  return roundCounter;
+}
+
+async function startRound() {
   gameState = 'WAITING';
   currentMult = 1.00;
   activeRoundBets = {};
-  roundCounter++;
+  const rid = await getNextRoundId();
   roundStartTime = Date.now();
 
   const seed = crypto.randomBytes(32).toString('hex');
   targetCrashPoint = generateCrashPoint();
-  saveRound(roundCounter, targetCrashPoint, seed);
+  saveRound(rid, targetCrashPoint, seed);
 
-  // Throttled Telegram: send every N rounds with some randomness
+  // Throttled Telegram
   telegramSkipCounter++;
   if (telegramSkipCounter >= telegramSendEvery) {
     telegramSkipCounter = 0;
-    // Add randomness: 50% chance to actually send when counter hits, so avg every 6-8 rounds
     if (Math.random() < 0.6) {
       sendTelegramMultiplierImage(targetCrashPoint);
     }
   }
 
   generateBots();
-  io.emit('game_event', { type: 'WAITING', time: 5, history: history.slice(0,20), roundId: roundCounter });
+  io.emit('game_event', { type: 'WAITING', time: 5, history: history.slice(0,20), roundId: rid });
   serverBots.forEach(b => { io.emit('game_event', { type: 'PLAYER_JOINED', id: b.id, name: b.name, amt: b.amt }); });
 
   let timeLeft = 5;
@@ -466,7 +478,7 @@ function startRound() {
     clearInterval(waitTickInterval);
     if (gameState !== 'WAITING') return;
     gameState = 'FLYING';
-    io.emit('game_event', { type: 'FLYING', roundId: roundCounter });
+    io.emit('game_event', { type: 'FLYING', roundId: rid });
     let startTime = Date.now();
 
     flightTickInterval = setInterval(() => {
@@ -478,7 +490,7 @@ function startRound() {
         gameState = 'CRASHED';
         history.unshift(currentMult);
         if (history.length > 25) history.pop();
-        io.emit('game_event', { type: 'CRASHED', finalMult: currentMult, roundId: roundCounter });
+        io.emit('game_event', { type: 'CRASHED', finalMult: currentMult, roundId: rid });
         processCrashedBets();
         setTimeout(startRound, 4000);
       } else {
@@ -546,9 +558,23 @@ io.on('connection', (socket) => {
   socket.on('disconnect', () => { console.log(`[Socket] Client disconnected: ${socket.id}`); });
 });
 
-server.listen(PORT, () => {
+/* ────────────────────────────────────────
+   SERVER STARTUP
+──────────────────────────────────────── */
+server.listen(PORT, async () => {
   console.log(`🚀 AviatorHela Server running on port ${PORT}`);
   console.log(`📡 Telegram Bot: ${TELEGRAM_BOT_TOKEN ? 'Active' : 'Inactive'}`);
   console.log(`💰 Megapay: ${MEGAPAY_API_KEY ? 'Configured' : 'Missing API Key'}`);
+
+  // Ensure DB is ready and round counter is initialized before first round
+  try {
+    await mongoose.connection.asPromise?.() || new Promise(r => mongoose.connection.once('open', r));
+    const lastRound = await Round.findOne().sort({ roundId: -1 });
+    if (lastRound && lastRound.roundId >= roundCounter) {
+      roundCounter = lastRound.roundId;
+      console.log(`[Engine] Resumed round counter at ${roundCounter}`);
+    }
+  } catch(e) { console.error('[Engine] Round init error:', e.message); }
+
   startRound();
 });
