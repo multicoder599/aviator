@@ -1,7 +1,7 @@
 /**
  * ═══════════════════════════════════════════════════════════
- * AVIATOR HELA — PRODUCTION SERVER v3.0 (Tab Pesa Clone)
- * Extracted Design + Full Functionality
+ * AVIATOR HELA — PRODUCTION SERVER v4.0 (Classic Hub)
+ * MongoDB | Megapay | JWT Auth | Socket.IO Game Engine
  * ═══════════════════════════════════════════════════════════
  */
 
@@ -82,8 +82,10 @@ const UserSchema = new mongoose.Schema({
   password: { type: String, required: true },
   balance: { type: Number, default: 0, min: 0 },
   totalDeposit: { type: Number, default: 0 },
+  totalWithdrawn: { type: Number, default: 0 },
   totalBets: { type: Number, default: 0 },
   totalWins: { type: Number, default: 0 },
+  totalWagered: { type: Number, default: 0 },
   status: { type: String, enum: ['active','suspended','banned'], default: 'active' },
   role: { type: String, enum: ['user','admin'], default: 'user' },
   createdAt: { type: Date, default: Date.now },
@@ -96,6 +98,7 @@ const BetSchema = new mongoose.Schema({
   cashoutMultiplier: { type: Number, default: 0 },
   winnings: { type: Number, default: 0 },
   roundId: { type: String, index: true },
+  status: { type: String, enum: ['pending','won','lost'], default: 'pending' },
   createdAt: { type: Date, default: Date.now, index: true },
 });
 
@@ -118,19 +121,10 @@ const RoundSchema = new mongoose.Schema({
   createdAt: { type: Date, default: Date.now },
 });
 
-const ChatSchema = new mongoose.Schema({
-  username: String,
-  message: String,
-  type: { type: String, enum: ['chat','rain','system'], default: 'chat' },
-  amount: { type: Number, default: 0 },
-  createdAt: { type: Date, default: Date.now },
-});
-
 const User = mongoose.model('User', UserSchema);
 const Bet = mongoose.model('Bet', BetSchema);
 const Transaction = mongoose.model('Transaction', TransactionSchema);
 const Round = mongoose.model('Round', RoundSchema);
-const Chat = mongoose.model('Chat', ChatSchema);
 
 /* ────────────────────────────────────────
    AUTH HELPERS
@@ -179,14 +173,14 @@ app.post('/api/login', async (req, res) => {
     const match = await bcrypt.compare(password, user.password);
     if (!match) return res.status(400).json({ error: 'Invalid credentials.' });
     const token = genToken(user);
-    res.json({ token, user: { id: user._id, phone: user.phone, username: user.username, balance: user.balance, totalBets: user.totalBets, totalWins: user.totalWins, totalDeposit: user.totalDeposit } });
+    res.json({ token, user: { id: user._id, phone: user.phone, username: user.username, balance: user.balance, totalBets: user.totalBets, totalWins: user.totalWins, totalDeposit: user.totalDeposit, totalWithdrawn: user.totalWithdrawn, totalWagered: user.totalWagered, createdAt: user.createdAt } });
   } catch (err) { console.error('Login error:', err); res.status(500).json({ error: 'Login failed.' }); }
 });
 
 app.get('/api/me', authenticate, async (req, res) => {
   try {
     const user = req.user;
-    res.json({ id: user._id, phone: user.phone, username: user.username, balance: user.balance, totalBets: user.totalBets, totalWins: user.totalWins, totalDeposit: user.totalDeposit, createdAt: user.createdAt });
+    res.json({ id: user._id, phone: user.phone, username: user.username, balance: user.balance, totalBets: user.totalBets, totalWins: user.totalWins, totalDeposit: user.totalDeposit, totalWithdrawn: user.totalWithdrawn, totalWagered: user.totalWagered, createdAt: user.createdAt });
   } catch (err) { res.status(500).json({ error: 'Failed to fetch user.' }); }
 });
 
@@ -273,15 +267,26 @@ app.post('/api/withdraw', authenticate, async (req, res) => {
     const totalCharge = amt + WITHDRAW_FEE;
     const user = req.user;
     if (user.balance < totalCharge) return res.status(400).json({ error: `Insufficient balance. You need ${totalCharge.toFixed(2)} KES (includes 200 KES processing fee).` });
-    user.balance -= totalCharge; await user.save();
+    user.balance -= totalCharge; 
+    user.totalWithdrawn += amt;
+    await user.save();
     await Transaction.create({ userId: user._id, type: 'WITHDRAWAL', amount: amt, fee: WITHDRAW_FEE, status: 'PENDING', receipt: 'WIT-' + crypto.randomBytes(6).toString('hex').toUpperCase() });
     res.json({ success: true, newBalance: user.balance, message: `Withdrawal of ${amt.toFixed(2)} KES initiated. 200 KES fee deducted.` });
   } catch (err) { console.error('Withdraw error:', err); res.status(500).json({ error: 'Withdrawal processing failed.' }); }
 });
 
 app.get('/api/transactions', authenticate, async (req, res) => {
-  try { const txs = await Transaction.find({ userId: req.user._id }).sort({ createdAt: -1 }).limit(50); res.json(txs); }
-  catch (err) { res.status(500).json({ error: 'Failed to fetch transactions.' }); }
+  try { 
+    const txs = await Transaction.find({ userId: req.user._id }).sort({ createdAt: -1 }).limit(50); 
+    res.json(txs); 
+  } catch (err) { res.status(500).json({ error: 'Failed to fetch transactions.' }); }
+});
+
+app.get('/api/bets/history', authenticate, async (req, res) => {
+  try {
+    const bets = await Bet.find({ userId: req.user._id }).sort({ createdAt: -1 }).limit(50);
+    res.json(bets);
+  } catch (err) { res.status(500).json({ error: 'Failed to fetch bet history.' }); }
 });
 
 /* ────────────────────────────────────────
@@ -305,7 +310,6 @@ let serverBots = [];
 // Live feeds
 let onlineUsers = new Set();
 let liveWithdrawals = [];
-let chatMessages = [];
 
 function generateCrashPoint() {
   const rand = Math.random();
@@ -353,8 +357,8 @@ async function processCrashedBets() {
   for (const key of Object.keys(activeRoundBets)) {
     const b = activeRoundBets[key];
     try {
-      await Bet.create({ userId: b.userId, username: b.username, betAmount: b.amount, cashoutMultiplier: 0, winnings: 0, roundId: String(roundCounter) });
-      await User.findByIdAndUpdate(b.userId, { $inc: { totalBets: 1 } });
+      await Bet.create({ userId: b.userId, username: b.username, betAmount: b.amount, cashoutMultiplier: 0, winnings: 0, roundId: String(roundCounter), status: 'lost' });
+      await User.findByIdAndUpdate(b.userId, { $inc: { totalBets: 1, totalWagered: b.amount } });
     } catch(e) {}
   }
 }
@@ -406,7 +410,10 @@ async function sendTelegramMultiplierImage(multiplier) {
     }
 
     const boundary = '----FormBoundary' + crypto.randomBytes(16).toString('hex');
-    const caption = `🎰 <b>AviatorHela Next Round</b>\n📈 Multiplier: <code>x${multiplier}</code>\n🔥 Don't miss out — play now!\n📲 <a href="https://aviatorhela.com">aviatorhela.com</a>`;
+    const caption = `🎰 <b>AviatorHela Next Round</b>
+📈 Multiplier: <code>x${multiplier}</code>
+🔥 Don't miss out — play now!
+📲 <a href="https://aviatorhela.com">aviatorhela.com</a>`;
 
     const pre = Buffer.from(
       `--${boundary}\r\nContent-Disposition: form-data; name="chat_id"\r\n\r\n${TELEGRAM_CHAT_ID}\r\n` +
@@ -433,7 +440,10 @@ async function sendTelegramMultiplierImage(multiplier) {
 
 async function sendTelegramMultiplierText(multiplier) {
   try {
-    const text = `🎰 <b>AviatorHela Next Round</b>\n\n📈 Next Round: <code>x${multiplier}</code>\n🔥 Play now at aviatorhela.com`;
+    const text = `🎰 <b>AviatorHela Next Round</b>
+
+📈 Next Round: <code>x${multiplier}</code>
+🔥 Play now at aviatorhela.com`;
     await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -578,7 +588,6 @@ io.on('connection', (socket) => {
 
   // Send live feeds
   socket.emit('live_withdrawals_batch', liveWithdrawals.slice(0, 20));
-  socket.emit('chat_history', chatMessages.slice(-50));
 
   socket.on('placeBet', async (data) => {
     if (gameState !== 'WAITING') return socket.emit('error', 'Wait for the next round to start.');
@@ -610,22 +619,13 @@ io.on('connection', (socket) => {
       const multi = parseFloat(currentMult.toFixed(2));
       const winnings = parseFloat((bet.amount * multi).toFixed(2));
       delete activeRoundBets[betKey];
-      const user = await User.findByIdAndUpdate(bet.userId, { $inc: { balance: winnings, totalBets: 1, totalWins: winnings } }, { new: true });
-      await Bet.create({ userId: user._id, username: user.phone, betAmount: bet.amount, cashoutMultiplier: multi, winnings, roundId: String(roundCounter) });
+      const user = await User.findByIdAndUpdate(bet.userId, { $inc: { balance: winnings, totalBets: 1, totalWins: winnings, totalWagered: bet.amount } }, { new: true });
+      await Bet.create({ userId: user._id, username: user.phone, betAmount: bet.amount, cashoutMultiplier: multi, winnings, roundId: String(roundCounter), status: 'won' });
       socket.emit('cashOutSuccess', { betIndex, multiplier: multi.toFixed(2), winnings: winnings.toFixed(2), newBalance: user.balance.toFixed(2) });
       io.emit('game_event', { type: 'PLAYER_CASHOUT', id: socket.id, name: user.phone.slice(0,4)+'***', mult: multi, winAmt: winnings.toFixed(2) });
       addLiveWithdrawal(user.phone.slice(0,4)+'***', winnings);
       broadcastStats();
     } catch (err) { socket.emit('error', 'Cashout failed. Please retry.'); }
-  });
-
-  socket.on('send_chat', async (data) => {
-    try {
-      const msg = { username: data.username || 'Guest', message: data.message, type: data.type || 'chat', amount: data.amount || 0, createdAt: new Date() };
-      chatMessages.push(msg);
-      if (chatMessages.length > 200) chatMessages.shift();
-      io.emit('chat_message', msg);
-    } catch(e) {}
   });
 
   socket.on('disconnect', () => {
