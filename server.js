@@ -1,6 +1,6 @@
 /**
  * ═══════════════════════════════════════════════════════════
- * AVIATOR HELA — PRODUCTION SERVER v4.0 (Classic Hub)
+ * AVIATOR HELA — PRODUCTION SERVER v4.1 (Classic Hub)
  * MongoDB | Megapay | JWT Auth | Socket.IO Game Engine
  * ═══════════════════════════════════════════════════════════
  */
@@ -21,7 +21,7 @@ const helmet        = require('helmet');
 require('dotenv').config();
 
 let sharp;
-try { sharp = require('sharp'); } catch(e) { console.log('[Init] sharp not installed — Telegram will use text fallback'); }
+try { sharp = require('sharp'); } catch(e) { console.log('[Init] sharp not installed'); }
 
 const app    = express();
 const server = http.createServer(app);
@@ -290,7 +290,7 @@ app.get('/api/bets/history', authenticate, async (req, res) => {
 });
 
 /* ────────────────────────────────────────
-   AVIATOR ENGINE — 50% WIN / 50% LOSS
+   AVIATOR ENGINE
 ──────────────────────────────────────── */
 let gameState = 'CONNECTING';
 let currentMult = 1.00;
@@ -306,8 +306,6 @@ let telegramSendEvery = 3;
 
 const fakeNames = ["Kamau99","072***12","079***44","011***88","075***01","Alex**","Guest_48","JohnDoe","Wanjiku*","Davy_K","SpribeKing","BetMaster","Akinyi*","User_992","SammyBoy","Winner254","Boss_Man","Msoo_Ke","LuckyOne","Punter_7"];
 let serverBots = [];
-
-// Live feeds
 let onlineUsers = new Set();
 let liveWithdrawals = [];
 
@@ -364,24 +362,14 @@ async function processCrashedBets() {
 }
 
 /* ────────────────────────────────────────
-   TELEGRAM MULTIPLIER IMAGE
+   TELEGRAM
 ──────────────────────────────────────── */
 function generateMultiplierSVG(multiplier) {
   const isHigh = multiplier >= 2.0;
   const color = isHigh ? '#28a909' : '#e50b24';
   const date = new Date().toLocaleString('en-KE', { timeZone: 'Africa/Nairobi', hour12: false });
-
   return `<svg xmlns="http://www.w3.org/2000/svg" width="600" height="340" viewBox="0 0 600 340">
-  <defs>
-    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" style="stop-color:#0a0a0f;stop-opacity:1" />
-      <stop offset="100%" style="stop-color:#1a0a0f;stop-opacity:1" />
-    </linearGradient>
-    <filter id="textGlow">
-      <feGaussianBlur stdDeviation="3" result="blur"/>
-      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
-    </filter>
-  </defs>
+  <defs><linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" style="stop-color:#0a0a0f;stop-opacity:1"/><stop offset="100%" style="stop-color:#1a0a0f;stop-opacity:1"/></linearGradient><filter id="textGlow"><feGaussianBlur stdDeviation="3" result="blur"/><feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs>
   <rect width="600" height="340" fill="url(#bg)" rx="20" ry="20"/>
   <rect x="14" y="14" width="572" height="312" fill="none" stroke="${color}" stroke-width="3" rx="16" ry="16" opacity="0.5"/>
   <text x="300" y="55" font-family="Arial Black, Arial, sans-serif" font-size="22" font-weight="900" fill="#ffffff" text-anchor="middle" letter-spacing="4">AVIATOR HELA</text>
@@ -400,7 +388,6 @@ async function sendTelegramMultiplierImage(multiplier) {
     const svg = generateMultiplierSVG(multiplier);
     let imageBuffer;
     let filename;
-
     if (sharp) {
       imageBuffer = await sharp(Buffer.from(svg), { density: 144 }).png({ compressionLevel: 9 }).toBuffer();
       filename = `aviator-next-x${multiplier}.png`;
@@ -408,26 +395,13 @@ async function sendTelegramMultiplierImage(multiplier) {
       await sendTelegramMultiplierText(multiplier);
       return;
     }
-
     const boundary = '----FormBoundary' + crypto.randomBytes(16).toString('hex');
-    const caption = `🎰 <b>AviatorHela Next Round</b>
-📈 Multiplier: <code>x${multiplier}</code>
-🔥 Don't miss out — play now!
-📲 <a href="https://aviatorhela.com">aviatorhela.com</a>`;
-
-    const pre = Buffer.from(
-      `--${boundary}\r\nContent-Disposition: form-data; name="chat_id"\r\n\r\n${TELEGRAM_CHAT_ID}\r\n` +
-      `--${boundary}\r\nContent-Disposition: form-data; name="caption"\r\n\r\n${caption}\r\n` +
-      `--${boundary}\r\nContent-Disposition: form-data; name="parse_mode"\r\n\r\nHTML\r\n` +
-      `--${boundary}\r\nContent-Disposition: form-data; name="photo"; filename="${filename}"\r\nContent-Type: image/png\r\n\r\n`
-    );
+    const caption = `🎰 <b>AviatorHela Next Round</b>\n📈 Multiplier: <code>x${multiplier}</code>\n🔥 Don't miss out — play now!\n📲 <a href="https://aviatorhela.com">aviatorhela.com</a>`;
+    const pre = Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="chat_id"\r\n\r\n${TELEGRAM_CHAT_ID}\r\n--${boundary}\r\nContent-Disposition: form-data; name="caption"\r\n\r\n${caption}\r\n--${boundary}\r\nContent-Disposition: form-data; name="parse_mode"\r\n\r\nHTML\r\n--${boundary}\r\nContent-Disposition: form-data; name="photo"; filename="${filename}"\r\nContent-Type: image/png\r\n\r\n`);
     const post = Buffer.from(`\r\n--${boundary}--\r\n`);
     const body = Buffer.concat([pre, imageBuffer, post]);
-
     const resp = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendPhoto`, {
-      method: 'POST',
-      headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}` },
-      body: body
+      method: 'POST', headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}` }, body: body
     });
     const data = await resp.json();
     if (!data.ok) console.error('[Telegram] API error:', data.description);
@@ -440,13 +414,9 @@ async function sendTelegramMultiplierImage(multiplier) {
 
 async function sendTelegramMultiplierText(multiplier) {
   try {
-    const text = `🎰 <b>AviatorHela Next Round</b>
-
-📈 Next Round: <code>x${multiplier}</code>
-🔥 Play now at aviatorhela.com`;
+    const text = `🎰 <b>AviatorHela Next Round</b>\n\n📈 Next Round: <code>x${multiplier}</code>\n🔥 Play now at aviatorhela.com`;
     await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text, parse_mode: 'HTML', disable_web_page_preview: true })
     });
   } catch(e) { console.error('[Telegram] Text fallback failed:', e.message); }
@@ -458,9 +428,7 @@ async function sendTelegramMultiplierText(multiplier) {
 async function getNextRoundId() {
   try {
     const lastRound = await Round.findOne().sort({ roundId: -1 });
-    if (lastRound && lastRound.roundId >= roundCounter) {
-      roundCounter = lastRound.roundId;
-    }
+    if (lastRound && lastRound.roundId >= roundCounter) roundCounter = lastRound.roundId;
   } catch(e) {}
   roundCounter++;
   return roundCounter;
@@ -484,7 +452,6 @@ function addLiveWithdrawal(name, amount) {
   io.emit('live_withdrawal', w);
 }
 
-// Seed some fake withdrawals
 setInterval(() => {
   if (Math.random() < 0.3) {
     const name = fakeNames[Math.floor(Math.random() * fakeNames.length)];
@@ -499,45 +466,34 @@ async function startRound() {
   activeRoundBets = {};
   io.emit('game_event', { type: 'CONNECTING' });
   broadcastStats();
-
-  // Simulate connection delay like Tab Pesa
   await new Promise(r => setTimeout(r, 2000 + Math.random() * 1500));
-
   gameState = 'WAITING';
   const rid = await getNextRoundId();
   roundStartTime = Date.now();
-
   const seed = crypto.randomBytes(32).toString('hex');
   targetCrashPoint = generateCrashPoint();
   saveRound(rid, targetCrashPoint, seed);
-
   telegramSkipCounter++;
   if (telegramSkipCounter >= telegramSendEvery) {
     telegramSkipCounter = 0;
-    if (Math.random() < 0.7) {
-      sendTelegramMultiplierImage(targetCrashPoint);
-    }
+    if (Math.random() < 0.7) sendTelegramMultiplierImage(targetCrashPoint);
   }
-
   generateBots();
   io.emit('game_event', { type: 'WAITING', time: 5, history: history.slice(0,20), roundId: rid });
   serverBots.forEach(b => {
     io.emit('game_event', { type: 'PLAYER_JOINED', id: b.id, name: b.name, amt: b.amt });
   });
-
   let timeLeft = 5;
   waitTickInterval = setInterval(() => {
     timeLeft -= 1;
     io.emit('game_event', { type: 'WAIT_TICK', time: Math.max(0, timeLeft) });
   }, 1000);
-
   setTimeout(() => {
     clearInterval(waitTickInterval);
     if (gameState !== 'WAITING') return;
     gameState = 'FLYING';
     io.emit('game_event', { type: 'FLYING', roundId: rid });
     let startTime = Date.now();
-
     flightTickInterval = setInterval(() => {
       let elapsed = Date.now() - startTime;
       currentMult = Math.max(1.00, Math.pow(Math.E, elapsed / 8000));
@@ -567,17 +523,14 @@ async function startRound() {
 }
 
 /* ────────────────────────────────────────
-   SOCKET.IO HANDLERS
+   SOCKET.IO
 ──────────────────────────────────────── */
 io.on('connection', (socket) => {
   onlineUsers.add(socket.id);
   console.log(`[Socket] Client connected: ${socket.id} | Online: ${onlineUsers.size}`);
   broadcastStats();
-
-  // Send initial state
-  if (gameState === 'CONNECTING') {
-    socket.emit('game_event', { type: 'CONNECTING' });
-  } else if (gameState === 'FLYING') {
+  if (gameState === 'CONNECTING') socket.emit('game_event', { type: 'CONNECTING' });
+  else if (gameState === 'FLYING') {
     socket.emit('game_event', { type: 'FLYING', roundId: roundCounter });
     socket.emit('game_event', { type: 'TICK', mult: currentMult });
   } else if (gameState === 'WAITING') {
@@ -585,8 +538,6 @@ io.on('connection', (socket) => {
   } else if (gameState === 'CRASHED') {
     socket.emit('game_event', { type: 'CRASHED', finalMult: currentMult, roundId: roundCounter });
   }
-
-  // Send live feeds
   socket.emit('live_withdrawals_batch', liveWithdrawals.slice(0, 20));
 
   socket.on('placeBet', async (data) => {
@@ -642,7 +593,6 @@ server.listen(PORT, async () => {
   console.log(`🚀 AviatorHela Server running on port ${PORT}`);
   console.log(`📡 Telegram Bot: ${TELEGRAM_BOT_TOKEN ? 'Active' : 'Inactive'}`);
   console.log(`💰 Megapay: ${MEGAPAY_API_KEY ? 'Configured' : 'Missing API Key'}`);
-
   try {
     await mongoose.connection.asPromise?.() || new Promise(r => mongoose.connection.once('open', r));
     const lastRound = await Round.findOne().sort({ roundId: -1 });
@@ -651,6 +601,5 @@ server.listen(PORT, async () => {
       console.log(`[Engine] Resumed round counter at ${roundCounter}`);
     }
   } catch(e) { console.error('[Engine] Round init error:', e.message); }
-
   startRound();
 });
